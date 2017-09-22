@@ -44,12 +44,21 @@ import (
 
 const (
 	NODENAME      = "NODENAME"
+	INTERVAL      = "BGPD_INTERVAL"
 	AS            = "AS"
 	CALICO_PREFIX = "/calico"
 	CALICO_BGP    = CALICO_PREFIX + "/bgp/v1"
 	CALICO_AGGR   = CALICO_PREFIX + "/ipam/v2/host"
 	CALICO_IPAM   = CALICO_PREFIX + "/v1/ipam"
 
+	IpPoolV4       = CALICO_IPAM + "/v4/pool"
+	GlobalBGP      = CALICO_BGP + "/global"
+	GlobalASN      = GlobalBGP + "/as_num"
+	GlobalNodeMesh = GlobalBGP + "/node_mesh"
+	GlobalLogging  = GlobalBGP + "/loglevel"
+	AllNodes       = CALICO_BGP + "/host"
+
+	PollingInterval    = 600
 	defaultDialTimeout = 30 * time.Second
 
 	aggregatedPrefixSetName = "aggregated"
@@ -142,8 +151,10 @@ func cleanUpRoutes() error {
 type Server struct {
 	t         tomb.Tomb
 	bgpServer *bgpserver.BgpServer
+	datastore calicoapi.DatastoreType
 	client    *calicocli.Client
 	etcd      etcd.KeysAPI
+	k8s       *k8sClient
 	ipv4      net.IP
 	ipv6      net.IP
 	ipam      *ipamCache
@@ -155,17 +166,6 @@ func NewServer() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	etcdConfig, err := getEtcdConfig(config)
-	if err != nil {
-		return nil, err
-	}
-
-	cli, err := etcd.New(etcdConfig)
-	if err != nil {
-		return nil, err
-	}
-	etcdCli := etcd.NewKeysAPI(cli)
 
 	calicoCli, err := calicocli.New(*config)
 	if err != nil {
@@ -190,14 +190,37 @@ func NewServer() (*Server, error) {
 
 	bgpServer := bgpserver.NewBgpServer()
 
-	return &Server{
+	datastoreType := config.Spec.DatastoreType
+	server := Server{
 		bgpServer: bgpServer,
+		datastore: datastoreType,
 		client:    calicoCli,
-		etcd:      etcdCli,
 		ipv4:      ipv4,
 		ipv6:      ipv6,
 		reloadCh:  make(chan []*bgptable.Path),
-	}, nil
+	}
+
+	if datastoreType == calicoapi.EtcdV2 {
+		etcdConfig, err := getEtcdConfig(config)
+		if err != nil {
+			return nil, err
+		}
+		cli, err := etcd.New(etcdConfig)
+		if err != nil {
+			return nil, err
+		}
+		server.etcd = etcd.NewKeysAPI(cli)
+	} else if datastoreType == calicoapi.Kubernetes {
+		k8s, err := NewK8sClient(&server)
+		if err != nil {
+			log.Fatal(err)
+		}
+		server.k8s = k8s
+	} else {
+		log.Fatal("unsupported datastore type: ", datastoreType)
+	}
+
+	return &server, nil
 }
 
 func (s *Server) Serve() {
@@ -222,15 +245,20 @@ func (s *Server) Serve() {
 		log.Fatal(err)
 	}
 
-	s.ipam = newIPAMCache(s.etcd, s.ipamUpdateHandler)
-	// sync IPAM and call ipamUpdateHandler
-	s.t.Go(func() error { return fmt.Errorf("syncIPAM: %s", s.ipam.sync()) })
-	// watch routes from other BGP peers and update FIB
-	s.t.Go(func() error { return fmt.Errorf("watchBGPPath: %s", s.watchBGPPath()) })
-	// watch prefix assigned and announce to other BGP peers
-	s.t.Go(func() error { return fmt.Errorf("watchPrefix: %s", s.watchPrefix()) })
-	// watch BGP configuration
-	s.t.Go(func() error { return fmt.Errorf("watchBGPConfig: %s", s.watchBGPConfig()) })
+	if s.datastore == calicoapi.EtcdV2 {
+		s.ipam = newIPAMCache(s.etcd, s.ipamUpdateHandler)
+		// sync IPAM and call ipamUpdateHandler
+		s.t.Go(func() error { return fmt.Errorf("syncIPAM: %s", s.ipam.sync()) })
+		// watch routes from other BGP peers and update FIB
+		s.t.Go(func() error { return fmt.Errorf("watchBGPPath: %s", s.watchBGPPath()) })
+		// watch prefix assigned and announce to other BGP peers
+		s.t.Go(func() error { return fmt.Errorf("watchPrefix: %s", s.watchPrefix()) })
+		// watch BGP configuration
+		s.t.Go(func() error { return fmt.Errorf("watchBGPConfig: %s", s.watchBGPConfig()) })
+	} else if s.datastore == calicoapi.Kubernetes {
+		s.t.Go(func() error { return fmt.Errorf("k8s interval loop: %s", s.k8s.IntervalLoop()) })
+	}
+
 	// watch routes added by kernel and announce to other BGP peers
 	s.t.Go(func() error { return fmt.Errorf("watchKernelRoute: %s", s.watchKernelRoute()) })
 
@@ -401,12 +429,12 @@ func (s *Server) getMeshNeighborConfigs() ([]*bgpconfig.Neighbor, error) {
 }
 
 // getNeighborConfigFromPeer returns a BGP neighbor configuration struct from *etcd.Node
-func getNeighborConfigFromPeer(node *etcd.Node, neighborType string) (*bgpconfig.Neighbor, error) {
+func getNeighborConfigFromPeer(peer string, neighborType string) (*bgpconfig.Neighbor, error) {
 	m := &struct {
 		IP  string `json:"ip"`
 		ASN string `json:"as_num"`
 	}{}
-	if err := json.Unmarshal([]byte(node.Value), m); err != nil {
+	if err := json.Unmarshal([]byte(peer), m); err != nil {
 		return nil, err
 	}
 	asn, err := numorstring.ASNumberFromString(m.ASN)
@@ -643,13 +671,13 @@ func (s *Server) watchBGPConfig() error {
 		handleNonMeshNeighbor := func(neighborType string) error {
 			switch res.Action {
 			case "delete":
-				n, err := getNeighborConfigFromPeer(res.PrevNode, neighborType)
+				n, err := getNeighborConfigFromPeer(res.PrevNode.Value, neighborType)
 				if err != nil {
 					return err
 				}
 				return s.bgpServer.DeleteNeighbor(n)
 			case "set", "create", "update", "compareAndSwap":
-				n, err := getNeighborConfigFromPeer(res.Node, neighborType)
+				n, err := getNeighborConfigFromPeer(res.Node.Value, neighborType)
 				if err != nil {
 					return err
 				}

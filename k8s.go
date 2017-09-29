@@ -16,14 +16,17 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	etcd "github.com/coreos/etcd/client"
 	_ "github.com/projectcalico/libcalico-go/lib/api"
 	backendapi "github.com/projectcalico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/libcalico-go/lib/backend/compat"
@@ -50,6 +53,7 @@ const (
 
 var (
 	lastBgpconfig = make(map[string]string)
+	lastIPPool = make(map[string]string)
 )
 
 type k8sClient struct {
@@ -59,6 +63,48 @@ type k8sClient struct {
 	k8scli            *kubernetes.Clientset
 	nodeBgpPeerClient resources.K8sNodeResourceClient
 	nodeBgpCfgClient  resources.K8sNodeResourceClient
+}
+
+type ActionList struct {
+	Add  []string
+	Upd  []string
+	Del  []string
+	Same []string
+}
+
+func CompareMap(lasts map[string]string, currs map[string]string) ActionList {
+	act := ActionList{}
+	for key, last := range lasts {
+		if cur, ok := currs[key]; ok == false {
+			act.Del = append(act.Del, key)
+		} else if last != cur {
+			act.Upd = append(act.Upd, key)
+		} else {
+			act.Same = append(act.Same, key)
+		}
+	}
+	for key, _ := range currs {
+		if _, ok := lasts[key]; ok == false {
+			act.Add = append(act.Add, key)
+		}
+	}
+	return act
+}
+
+// populateFromKVPairs populates the vars KV map from the supplied set of
+// KVPairs.  This uses the libcalico-go compat module and serialization functions
+// to write out the KVPairs in etcdv2 format.  This works in conjunction with the
+// etcdVarClient defined below which provides a "mock" etcd backend which actually
+// just writes out data to the vars map.
+func populateFromKVPairs(kvps []*model.KVPair, vars map[string]string) {
+	// Create a etcdVarClient to write the KVP results in the vars map, using the
+	// compat adaptor to write the values in etcdv2 format.
+	client := compat.NewAdaptor(&etcdVarClient{vars: vars})
+	for _, kvp := range kvps {
+		if _, err := client.Apply(kvp); err != nil {
+			log.Error("Failed to convert k8s data to etcdv2 equivalent: %s = %s", kvp.Key, kvp.Value)
+		}
+	}
 }
 
 func NewK8sClient(s *Server) (*k8sClient, error) {
@@ -89,18 +135,29 @@ func NewK8sClient(s *Server) (*k8sClient, error) {
 	}, nil
 }
 
-func (c *k8sClient) IntervalLoop() error {
-	if err := c.updatePrefix(); err != nil {
+type intervalProcessor struct {
+	k8scli *k8sClient
+	ipam   *ipamCacheK8s
+}
+
+func (p *intervalProcessor) IntervalLoop() error {
+	if err := p.k8scli.updatePrefix(); err != nil {
 		return err
 	}
-	if err := c.initialNeighborConfigs(); err != nil {
+	if err := p.k8scli.initialNeighborConfigs(); err != nil {
 		return err
 	}
+	ippools, err := p.ipam.getIPPools()
+	if err != nil {
+		return err
+	}
+	lastIPPool = ippools
 	for {
 		log.Debug("polling")
-		c.checkBGPConfig()
+		p.k8scli.checkBGPConfig()
+		p.ipam.sync()
 		select {
-		case <-time.After(time.Duration(c.interval) * time.Second):
+		case <-time.After(time.Duration(p.k8scli.interval) * time.Second):
 			continue
 		}
 	}
@@ -169,32 +226,6 @@ func (c *k8sClient) getNeighborConfigs(bgpconfig map[string]string) ([]*svbgpcon
 	}
 	log.Debugf("neighbors=%s", neighbors)
 	return neighbors, nil
-}
-
-type ActionList struct {
-	Add  []string
-	Upd  []string
-	Del  []string
-	Same []string
-}
-
-func CompareMap(lasts map[string]string, currs map[string]string) ActionList {
-	act := ActionList{}
-	for key, last := range lasts {
-		if cur, ok := currs[key]; ok == false {
-			act.Del = append(act.Del, key)
-		} else if last != cur {
-			act.Upd = append(act.Upd, key)
-		} else {
-			act.Same = append(act.Same, key)
-		}
-	}
-	for key, _ := range currs {
-		if _, ok := lasts[key]; ok == false {
-			act.Add = append(act.Add, key)
-		}
-	}
-	return act
 }
 
 func (c *k8sClient) checkBGPConfig() error {
@@ -438,22 +469,6 @@ func (c *k8sClient) populateNodeDetails(kNode *kapiv1.Node, vars map[string]stri
 	return nil
 }
 
-// populateFromKVPairs populates the vars KV map from the supplied set of
-// KVPairs.  This uses the libcalico-go compat module and serialization functions
-// to write out the KVPairs in etcdv2 format.  This works in conjunction with the
-// etcdVarClient defined below which provides a "mock" etcd backend which actually
-// just writes out data to the vars map.
-func populateFromKVPairs(kvps []*model.KVPair, vars map[string]string) {
-	// Create a etcdVarClient to write the KVP results in the vars map, using the
-	// compat adaptor to write the values in etcdv2 format.
-	client := compat.NewAdaptor(&etcdVarClient{vars: vars})
-	for _, kvp := range kvps {
-		if _, err := client.Apply(kvp); err != nil {
-			log.Error("Failed to convert k8s data to etcdv2 equivalent: %s = %s", kvp.Key, kvp.Value)
-		}
-	}
-}
-
 // etcdVarClient implements the libcalico-go backend api.Client interface.  It is used to
 // write the KVPairs retrieved from the Kubernetes datastore driver into the KV map
 // using etcdv2 naming scheme.
@@ -517,4 +532,106 @@ func (c *etcdVarClient) EnsureInitialized() error {
 func (c *etcdVarClient) EnsureCalicoNodeInitialized(node string) error {
 	log.Fatal("EnsureCalicoNodeInitialized should not be invoked")
 	return nil
+}
+
+type ipamCacheK8s struct {
+	mu            sync.RWMutex
+	m             map[string]*ipPool
+	server        *Server
+	updateHandler func(*ipPool) error
+}
+
+// match checks whether we have an IP pool which contains the given prefix.
+// If we have, it returns the pool.
+func (c *ipamCacheK8s) match(prefix string) *ipPool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, p := range c.m {
+		if p.contain(prefix) {
+			return p
+		}
+	}
+	return nil
+}
+
+func (c *ipamCacheK8s) updateWrap(ippool string, del bool) error {
+	return c.update(nil, ippool, del)
+}
+
+// update updates the internal map with IPAM updates when the update
+// is new addtion to the map or changes the existing item, it calls
+// updateHandler
+func (c *ipamCacheK8s) update(_ *etcd.Node, ippool string, del bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	log.Printf("update ipam cache: %s %t", ippool, del)
+	if ippool == "" {
+		return nil
+	}
+	p := &ipPool{}
+	if err := json.Unmarshal([]byte(ippool), p); err != nil {
+		return err
+	}
+	if p.CIDR == "" {
+		return fmt.Errorf("empty cidr: %s", ippool)
+	}
+	q := c.m[p.CIDR]
+	if del {
+		delete(c.m, p.CIDR)
+		return nil
+	} else if p.equal(q) {
+		return nil
+	}
+
+	c.m[p.CIDR] = p
+
+	if c.updateHandler != nil {
+		return c.updateHandler(p)
+	}
+	return nil
+}
+
+func (c *ipamCacheK8s) getIPPools() (map[string]string, error) {
+	var ippools = make(map[string]string)
+	kvps, err := c.server.client.Backend.List(model.IPPoolListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	populateFromKVPairs(kvps, ippools)
+	return ippools, nil
+}
+
+// sync synchronizes the contents under /calico/v1/ipam
+func (c *ipamCacheK8s) sync() error {
+	currIPPool, err := c.getIPPools()
+	if err != nil {
+		return err
+	}
+	log.Debugf("sync lastIPPool=%s", lastIPPool)
+	log.Debugf("sync currIPPool=%s", currIPPool)
+	if reflect.DeepEqual(lastIPPool, currIPPool) {
+		return nil
+	}
+	act := CompareMap(lastIPPool, currIPPool)
+	for _, key := range append(act.Add, act.Upd...) {
+		if err := c.updateWrap(currIPPool[key], false); err != nil {
+			return err
+		}
+	}
+	for _, key := range act.Del {
+		if err := c.updateWrap(lastIPPool[key], true); err != nil {
+			return err
+		}
+	}
+	lastIPPool = currIPPool
+	return nil
+}
+
+// create new IPAM cache
+func NewIPAMCacheK8s(s *Server, updateHandler func(*ipPool) error) *ipamCacheK8s {
+	return &ipamCacheK8s{
+		m:             make(map[string]*ipPool),
+		server:        s,
+		updateHandler: updateHandler,
+	}
 }

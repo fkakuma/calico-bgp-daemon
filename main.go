@@ -67,6 +67,12 @@ const (
 	RTPROT_GOBGP = 0x11
 )
 
+type IpamCache interface {
+	match(string) *ipPool
+	update(*etcd.Node, string, bool) error
+	sync() error
+}
+
 // VERSION is filled out during the build process (using git describe output)
 var VERSION string
 
@@ -154,10 +160,10 @@ type Server struct {
 	datastore calicoapi.DatastoreType
 	client    *calicocli.Client
 	etcd      etcd.KeysAPI
-	k8s       *k8sClient
+	process   *intervalProcessor
 	ipv4      net.IP
 	ipv6      net.IP
-	ipam      *ipamCache
+	ipam      IpamCache
 	reloadCh  chan []*bgptable.Path
 }
 
@@ -215,7 +221,12 @@ func NewServer() (*Server, error) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		server.k8s = k8s
+		ipam := NewIPAMCacheK8s(&server, server.ipamUpdateHandler)
+		server.ipam = ipam
+		server.process = &intervalProcessor {
+			k8scli: k8s,
+			ipam:   ipam,
+		}
 	} else {
 		log.Fatal("unsupported datastore type: ", datastoreType)
 	}
@@ -256,7 +267,9 @@ func (s *Server) Serve() {
 		// watch BGP configuration
 		s.t.Go(func() error { return fmt.Errorf("watchBGPConfig: %s", s.watchBGPConfig()) })
 	} else if s.datastore == calicoapi.Kubernetes {
-		s.t.Go(func() error { return fmt.Errorf("k8s interval loop: %s", s.k8s.IntervalLoop()) })
+		// watch routes from other BGP peers and update FIB
+		s.t.Go(func() error { return fmt.Errorf("watchBGPPath: %s", s.watchBGPPath()) })
+		s.t.Go(func() error { return fmt.Errorf("k8s interval loop: %s", s.process.IntervalLoop()) })
 	}
 
 	// watch routes added by kernel and announce to other BGP peers

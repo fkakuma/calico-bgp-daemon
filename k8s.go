@@ -26,11 +26,8 @@ import (
 	"sync"
 	"time"
 
-	etcd "github.com/coreos/etcd/client"
-	_ "github.com/projectcalico/libcalico-go/lib/api"
 	backendapi "github.com/projectcalico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/libcalico-go/lib/backend/compat"
-	_ "github.com/projectcalico/libcalico-go/lib/backend/k8s"
 	"github.com/projectcalico/libcalico-go/lib/backend/k8s/resources"
 	"github.com/projectcalico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/libcalico-go/lib/numorstring"
@@ -53,7 +50,7 @@ const (
 
 var (
 	lastBgpconfig = make(map[string]string)
-	lastIPPool = make(map[string]string)
+	lastIPPool    = make(map[string]string)
 )
 
 type k8sClient struct {
@@ -554,14 +551,14 @@ func (c *ipamCacheK8s) match(prefix string) *ipPool {
 	return nil
 }
 
-func (c *ipamCacheK8s) updateWrap(ippool string, del bool) error {
-	return c.update(nil, ippool, del)
-}
-
 // update updates the internal map with IPAM updates when the update
 // is new addtion to the map or changes the existing item, it calls
 // updateHandler
-func (c *ipamCacheK8s) update(_ *etcd.Node, ippool string, del bool) error {
+func (c *ipamCacheK8s) update(ipPoolData interface{}, del bool) error {
+	if reflect.TypeOf(ipPoolData) != reflect.TypeOf("") {
+		log.Fatal("ipamcache parameter type error: %s", reflect.TypeOf(ipPoolData))
+	}
+	ippool := ipPoolData.(string)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	log.Printf("update ipam cache: %s %t", ippool, del)
@@ -614,12 +611,12 @@ func (c *ipamCacheK8s) sync() error {
 	}
 	act := CompareMap(lastIPPool, currIPPool)
 	for _, key := range append(act.Add, act.Upd...) {
-		if err := c.updateWrap(currIPPool[key], false); err != nil {
+		if err := c.update(currIPPool[key], false); err != nil {
 			return err
 		}
 	}
 	for _, key := range act.Del {
-		if err := c.updateWrap(lastIPPool[key], true); err != nil {
+		if err := c.update(lastIPPool[key], true); err != nil {
 			return err
 		}
 	}

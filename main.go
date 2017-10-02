@@ -69,7 +69,7 @@ const (
 
 type IpamCache interface {
 	match(string) *ipPool
-	update(*etcd.Node, string, bool) error
+	update(interface{}, bool) error
 	sync() error
 }
 
@@ -223,7 +223,7 @@ func NewServer() (*Server, error) {
 		}
 		ipam := NewIPAMCacheK8s(&server, server.ipamUpdateHandler)
 		server.ipam = ipam
-		server.process = &intervalProcessor {
+		server.process = &intervalProcessor{
 			k8scli: k8s,
 			ipam:   ipam,
 		}

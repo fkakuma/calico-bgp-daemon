@@ -18,6 +18,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -70,14 +71,14 @@ func (c *ipamCache) match(prefix string) *ipPool {
 	return nil
 }
 
-func (c *ipamCache) updateWrap(node *etcd.Node, del bool) error {
-	return c.update(node, "", del)
-}
-
 // update updates the internal map with IPAM updates when the update
 // is new addtion to the map or changes the existing item, it calls
 // updateHandler
-func (c *ipamCache) update(node *etcd.Node, _ string, del bool) error {
+func (c *ipamCache) update(nodeEtcd interface{}, del bool) error {
+	if reflect.TypeOf(nodeEtcd) != reflect.TypeOf(&etcd.Node{}) {
+		log.Fatal("ipamcache parameter type error: %s", reflect.TypeOf(nodeEtcd))
+	}
+	node := nodeEtcd.(*etcd.Node)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	log.Printf("update ipam cache: %s, %v, %t", node.Key, node.Value, del)
@@ -114,7 +115,7 @@ func (c *ipamCache) syncsubr(n *etcd.Node) error {
 				return err
 			}
 		} else {
-			if err := c.updateWrap(node, false); err != nil {
+			if err := c.update(node, false); err != nil {
 				return err
 			}
 		}
@@ -157,7 +158,7 @@ func (c *ipamCache) sync() error {
 			log.Printf("unhandled action: %s", res.Action)
 			continue
 		}
-		if err = c.updateWrap(node, del); err != nil {
+		if err = c.update(node, del); err != nil {
 			return err
 		}
 	}

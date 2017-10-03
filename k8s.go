@@ -104,6 +104,35 @@ func populateFromKVPairs(kvps []*model.KVPair, vars map[string]string) {
 	}
 }
 
+type IntervalProcessor struct {
+	k8scli *k8sClient
+	ipam   *ipamCacheK8s
+}
+
+func (p *IntervalProcessor) IntervalLoop() error {
+	if err := p.k8scli.updatePrefix(); err != nil {
+		return err
+	}
+	if err := p.k8scli.initialNeighborConfigs(); err != nil {
+		return err
+	}
+	ippools, err := p.ipam.getIPPools()
+	if err != nil {
+		return err
+	}
+	lastIPPool = ippools
+	for {
+		log.Debug("polling")
+		p.k8scli.checkBGPConfig()
+		p.ipam.sync()
+		select {
+		case <-time.After(time.Duration(p.k8scli.interval) * time.Second):
+			continue
+		}
+	}
+}
+
+// create new Kubernetes client
 func NewK8sClient(s *Server) (*k8sClient, error) {
 	loadingRules := clientcmd.ClientConfigLoadingRules{}
 	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
@@ -130,34 +159,6 @@ func NewK8sClient(s *Server) (*k8sClient, error) {
 		nodeBgpPeerClient: resources.NewNodeBGPPeerClient(cs),
 		nodeBgpCfgClient:  resources.NewNodeBGPConfigClient(cs),
 	}, nil
-}
-
-type intervalProcessor struct {
-	k8scli *k8sClient
-	ipam   *ipamCacheK8s
-}
-
-func (p *intervalProcessor) IntervalLoop() error {
-	if err := p.k8scli.updatePrefix(); err != nil {
-		return err
-	}
-	if err := p.k8scli.initialNeighborConfigs(); err != nil {
-		return err
-	}
-	ippools, err := p.ipam.getIPPools()
-	if err != nil {
-		return err
-	}
-	lastIPPool = ippools
-	for {
-		log.Debug("polling")
-		p.k8scli.checkBGPConfig()
-		p.ipam.sync()
-		select {
-		case <-time.After(time.Duration(p.k8scli.interval) * time.Second):
-			continue
-		}
-	}
 }
 
 func (c *k8sClient) updatePrefix() error {
@@ -197,6 +198,8 @@ func (c *k8sClient) initialNeighborConfigs() error {
 	return nil
 }
 
+// getNeighborConfigs returns the complete list of BGP neighbor configuration
+// which the node should peer.
 func (c *k8sClient) getNeighborConfigs(bgpconfig map[string]string) ([]*svbgpconfig.Neighbor, error) {
 	var neighbors []*svbgpconfig.Neighbor
 	if mesh, ok := bgpconfig[GlobalNodeMesh]; ok == false {
@@ -225,6 +228,9 @@ func (c *k8sClient) getNeighborConfigs(bgpconfig map[string]string) ([]*svbgpcon
 	return neighbors, nil
 }
 
+// checkBGPConfig checks the difference from the last BGP config information.
+// But in a case of the following changing, return error.
+//   /calico/bgp/v1/host/$NODENAME or /calico/global/as_num
 func (c *k8sClient) checkBGPConfig() error {
 	curBgpconfig, err := c.getBGPConfig()
 	if err != nil {
@@ -538,6 +544,15 @@ type ipamCacheK8s struct {
 	updateHandler func(*ipPool) error
 }
 
+// create new IPAM cache
+func NewIPAMCacheK8s(s *Server, updateHandler func(*ipPool) error) *ipamCacheK8s {
+	return &ipamCacheK8s{
+		m:             make(map[string]*ipPool),
+		server:        s,
+		updateHandler: updateHandler,
+	}
+}
+
 // match checks whether we have an IP pool which contains the given prefix.
 // If we have, it returns the pool.
 func (c *ipamCacheK8s) match(prefix string) *ipPool {
@@ -622,13 +637,4 @@ func (c *ipamCacheK8s) sync() error {
 	}
 	lastIPPool = currIPPool
 	return nil
-}
-
-// create new IPAM cache
-func NewIPAMCacheK8s(s *Server, updateHandler func(*ipPool) error) *ipamCacheK8s {
-	return &ipamCacheK8s{
-		m:             make(map[string]*ipPool),
-		server:        s,
-		updateHandler: updateHandler,
-	}
 }

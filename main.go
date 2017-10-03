@@ -58,7 +58,7 @@ const (
 	GlobalLogging  = GlobalBGP + "/loglevel"
 	AllNodes       = CALICO_BGP + "/host"
 
-	PollingInterval    = 600
+	PollingInterval    = 300
 	defaultDialTimeout = 30 * time.Second
 
 	aggregatedPrefixSetName = "aggregated"
@@ -160,7 +160,7 @@ type Server struct {
 	datastore calicoapi.DatastoreType
 	client    *calicocli.Client
 	etcd      etcd.KeysAPI
-	process   *intervalProcessor
+	process   *IntervalProcessor
 	ipv4      net.IP
 	ipv6      net.IP
 	ipam      IpamCache
@@ -223,7 +223,7 @@ func NewServer() (*Server, error) {
 		}
 		ipam := NewIPAMCacheK8s(&server, server.ipamUpdateHandler)
 		server.ipam = ipam
-		server.process = &intervalProcessor{
+		server.process = &IntervalProcessor{
 			k8scli: k8s,
 			ipam:   ipam,
 		}
@@ -267,9 +267,9 @@ func (s *Server) Serve() {
 		// watch BGP configuration
 		s.t.Go(func() error { return fmt.Errorf("watchBGPConfig: %s", s.watchBGPConfig()) })
 	} else if s.datastore == calicoapi.Kubernetes {
+		s.t.Go(func() error { return fmt.Errorf("k8s interval loop: %s", s.process.IntervalLoop()) })
 		// watch routes from other BGP peers and update FIB
 		s.t.Go(func() error { return fmt.Errorf("watchBGPPath: %s", s.watchBGPPath()) })
-		s.t.Go(func() error { return fmt.Errorf("k8s interval loop: %s", s.process.IntervalLoop()) })
 	}
 
 	// watch routes added by kernel and announce to other BGP peers

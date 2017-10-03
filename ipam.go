@@ -18,6 +18,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -76,7 +77,7 @@ func (c *ipamCache) match(prefix string) *ipPool {
 // updateHandler
 func (c *ipamCache) update(nodeEtcd interface{}, del bool) error {
 	if reflect.TypeOf(nodeEtcd) != reflect.TypeOf(&etcd.Node{}) {
-		log.Fatal("ipamcache parameter type error: %s", reflect.TypeOf(nodeEtcd))
+		log.Fatalf("unknown parameter type: %s", reflect.TypeOf(nodeEtcd))
 	}
 	node := nodeEtcd.(*etcd.Node)
 	c.mu.Lock()

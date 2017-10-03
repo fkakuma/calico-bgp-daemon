@@ -1,5 +1,5 @@
-hash: 846447c94e44fd704d7f36d77e110ffc441c4e0e975d9f6218d7b34b5f13ffeb
-updated: 2017-09-22T02:43:26.236193872Z
+hash: a11c390e4326539e32a54ef6e71fbe5fae8adf7f6a836bb4a8ae4b81dc13efd0
+updated: 2017-10-04T00:59:10.714193307Z
 imports:
 - name: cloud.google.com/go
   version: 3b1ae45394a234c385be014e9a488f2bb6eef821
@@ -343,10 +343,7 @@ imports:
   - kubernetes/typed/storage/v1
   - kubernetes/typed/storage/v1beta1
   - pkg/api
-  - pkg/api/errors
   - pkg/api/install
-  - pkg/api/meta
-  - pkg/api/unversioned
   - pkg/api/v1
   - pkg/apis/apps
   - pkg/apis/apps/install
@@ -387,15 +384,9 @@ imports:
   - pkg/apis/storage/install
   - pkg/apis/storage/v1
   - pkg/apis/storage/v1beta1
-  - pkg/fields
-  - pkg/runtime
-  - pkg/runtime/schema
-  - pkg/runtime/serializer
   - pkg/util
   - pkg/util/parsers
-  - pkg/util/wait
   - pkg/version
-  - pkg/watch
   - plugin/pkg/client/auth
   - plugin/pkg/client/auth/gcp
   - plugin/pkg/client/auth/oidc

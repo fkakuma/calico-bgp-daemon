@@ -47,11 +47,6 @@ const (
 	Act_same = "same"
 )
 
-var (
-	lastBgpconfig = make(map[string]string)
-	lastIPPool    = make(map[string]string)
-)
-
 type ActionList struct {
 	Add  []string
 	Upd  []string
@@ -104,14 +99,14 @@ func (p *IntervalProcessor) IntervalLoop() error {
 	if err := p.k8scli.updatePrefix(); err != nil {
 		return err
 	}
-	if err := p.k8scli.initialNeighborConfigs(); err != nil {
+	if err := p.k8scli.initNeighborConfigs(); err != nil {
 		return err
 	}
-	ippools, err := p.ipam.getIPPools()
+	ippool, err := p.ipam.getIPPools()
 	if err != nil {
 		return err
 	}
-	lastIPPool = ippools
+	p.ipam.lastIPPool = ippool
 	for {
 		log.Debug("polling")
 		p.ipam.sync()
@@ -129,6 +124,7 @@ type k8sClient struct {
 	k8scli            *kubernetes.Clientset
 	nodeBgpPeerClient resources.K8sNodeResourceClient
 	nodeBgpCfgClient  resources.K8sNodeResourceClient
+	lastBgpconfig     map[string]string
 }
 
 // create new Kubernetes client
@@ -173,13 +169,13 @@ func (c *k8sClient) updatePrefix() error {
 	return nil
 }
 
-func (c *k8sClient) initialNeighborConfigs() error {
+func (c *k8sClient) initNeighborConfigs() error {
 	bgpconfig, err := c.getBGPConfig()
 	if err != nil {
 		return err
 	}
-	lastBgpconfig = bgpconfig
-	neighborConfigs, err := c.getNeighborConfigs(bgpconfig)
+	c.lastBgpconfig = bgpconfig
+	neighborConfigs, err := c.getNeighborConfigs(c.lastBgpconfig)
 	if err != nil {
 		return err
 	}
@@ -229,12 +225,12 @@ func (c *k8sClient) checkBGPConfig() error {
 	if err != nil {
 		return nil
 	}
-	log.Debugf("checkBGPConfig lastBgpconfig=%s", lastBgpconfig)
-	log.Debugf("checkBGPConfig curBgpconfig=%s", curBgpconfig)
-	if reflect.DeepEqual(lastBgpconfig, curBgpconfig) {
+	log.Debugf("checkBGPConfig lastBgpconfig: %s", c.lastBgpconfig)
+	if reflect.DeepEqual(c.lastBgpconfig, curBgpconfig) {
 		return nil
 	}
-	act := CompareMap(lastBgpconfig, curBgpconfig)
+	act := CompareMap(c.lastBgpconfig, curBgpconfig)
+	log.Debugf("checkBGPConfig action list: %v", act)
 	for _, key := range act.Add {
 		if err := c.updateBGPConfig(Act_add, key, curBgpconfig); err != nil {
 			return err
@@ -246,11 +242,11 @@ func (c *k8sClient) checkBGPConfig() error {
 		}
 	}
 	for _, key := range act.Del {
-		if err := c.updateBGPConfig(Act_del, key, lastBgpconfig); err != nil {
+		if err := c.updateBGPConfig(Act_del, key, c.lastBgpconfig); err != nil {
 			return err
 		}
 	}
-	lastBgpconfig = curBgpconfig
+	c.lastBgpconfig = curBgpconfig
 	return nil
 }
 
@@ -267,7 +263,7 @@ func (c *k8sClient) updateBGPConfig(action string, key string, bgpconfig map[str
 		case Act_add, Act_upd:
 			return c.server.bgpServer.AddNeighbor(n)
 		}
-		log.Printf("unhandled action: %s", action)
+		log.Printf("Unhandled action: %s", action)
 		return nil
 	}
 
@@ -284,7 +280,7 @@ func (c *k8sClient) updateBGPConfig(action string, key string, bgpconfig map[str
 	case strings.HasPrefix(key, AllNodes):
 		elems := strings.Split(key, "/")
 		if len(elems) < 4 {
-			log.Printf("unhandled key: %s", key)
+			log.Printf("Unhandled key: %s", key)
 			return nil
 		}
 		deleteNeighbor := func(address string) error {
@@ -308,7 +304,7 @@ func (c *k8sClient) updateBGPConfig(action string, key string, bgpconfig map[str
 				}
 			case Act_add, Act_upd:
 				if action == Act_upd {
-					if err = deleteNeighbor(lastBgpconfig[key]); err != nil {
+					if err = deleteNeighbor(c.lastBgpconfig[key]); err != nil {
 						return err
 					}
 				}
@@ -366,7 +362,7 @@ func (c *k8sClient) updateBGPConfig(action string, key string, bgpconfig map[str
 				}
 			}
 		default:
-			log.Printf("unhandled key: %s", key)
+			log.Printf("Unhandled key: %s", key)
 		}
 	case strings.HasPrefix(key, fmt.Sprintf("%s/as_num", GlobalBGP)):
 		log.Println("Global AS number update. Restart")
@@ -428,7 +424,7 @@ func (c *k8sClient) getBGPConfig() (map[string]string, error) {
 		}
 	}
 
-	log.Debugf("node detail bgpconfig=%#v", bgpconfig)
+	log.Debugf("Get bgp config: %s", bgpconfig)
 	return bgpconfig, err
 }
 
@@ -535,6 +531,7 @@ type ipamCacheK8s struct {
 	m             map[string]*ipPool
 	server        *Server
 	updateHandler func(*ipPool) error
+	lastIPPool    map[string]string
 }
 
 // create new IPAM cache
@@ -564,7 +561,8 @@ func (c *ipamCacheK8s) match(prefix string) *ipPool {
 // updateHandler
 func (c *ipamCacheK8s) update(ipPoolData interface{}, del bool) error {
 	if reflect.TypeOf(ipPoolData) != reflect.TypeOf("") {
-		log.Fatal("ipamcache parameter type error: %s", reflect.TypeOf(ipPoolData))
+		log.Printf("ipamcache update parameter type error: %s", reflect.TypeOf(ipPoolData))
+		os.Exit(1)
 	}
 	ippool := ipPoolData.(string)
 	c.mu.Lock()
@@ -603,6 +601,7 @@ func (c *ipamCacheK8s) getIPPools() (map[string]string, error) {
 		return nil, err
 	}
 	populateFromKVPairs(kvps, ippools)
+	log.Debugf("Get ip pool: %s", ippools)
 	return ippools, nil
 }
 
@@ -612,22 +611,21 @@ func (c *ipamCacheK8s) sync() error {
 	if err != nil {
 		return err
 	}
-	log.Debugf("sync lastIPPool=%s", lastIPPool)
-	log.Debugf("sync currIPPool=%s", currIPPool)
-	if reflect.DeepEqual(lastIPPool, currIPPool) {
+	log.Debugf("sync lastIPPool: %s", c.lastIPPool)
+	if reflect.DeepEqual(c.lastIPPool, currIPPool) {
 		return nil
 	}
-	act := CompareMap(lastIPPool, currIPPool)
+	act := CompareMap(c.lastIPPool, currIPPool)
 	for _, key := range append(act.Add, act.Upd...) {
 		if err := c.update(currIPPool[key], false); err != nil {
 			return err
 		}
 	}
 	for _, key := range act.Del {
-		if err := c.update(lastIPPool[key], true); err != nil {
+		if err := c.update(c.lastIPPool[key], true); err != nil {
 			return err
 		}
 	}
-	lastIPPool = currIPPool
+	c.lastIPPool = currIPPool
 	return nil
 }

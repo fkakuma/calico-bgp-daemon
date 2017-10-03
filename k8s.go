@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"os"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,15 +51,6 @@ var (
 	lastBgpconfig = make(map[string]string)
 	lastIPPool    = make(map[string]string)
 )
-
-type k8sClient struct {
-	interval          int
-	node              string
-	server            *Server
-	k8scli            *kubernetes.Clientset
-	nodeBgpPeerClient resources.K8sNodeResourceClient
-	nodeBgpCfgClient  resources.K8sNodeResourceClient
-}
 
 type ActionList struct {
 	Add  []string
@@ -105,8 +95,9 @@ func populateFromKVPairs(kvps []*model.KVPair, vars map[string]string) {
 }
 
 type IntervalProcessor struct {
-	k8scli *k8sClient
-	ipam   *ipamCacheK8s
+	interval int
+	k8scli   *k8sClient
+	ipam     *ipamCacheK8s
 }
 
 func (p *IntervalProcessor) IntervalLoop() error {
@@ -123,13 +114,21 @@ func (p *IntervalProcessor) IntervalLoop() error {
 	lastIPPool = ippools
 	for {
 		log.Debug("polling")
-		p.k8scli.checkBGPConfig()
 		p.ipam.sync()
+		p.k8scli.checkBGPConfig()
 		select {
-		case <-time.After(time.Duration(p.k8scli.interval) * time.Second):
+		case <-time.After(time.Duration(p.interval) * time.Second):
 			continue
 		}
 	}
+}
+
+type k8sClient struct {
+	node              string
+	server            *Server
+	k8scli            *kubernetes.Clientset
+	nodeBgpPeerClient resources.K8sNodeResourceClient
+	nodeBgpCfgClient  resources.K8sNodeResourceClient
 }
 
 // create new Kubernetes client
@@ -146,13 +145,7 @@ func NewK8sClient(s *Server) (*k8sClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	interval := PollingInterval
-	i, err := strconv.Atoi(os.Getenv(INTERVAL))
-	if err == nil {
-		interval = i
-	}
 	return &k8sClient{
-		interval:          interval,
 		node:              os.Getenv(NODENAME),
 		server:            s,
 		k8scli:            cs,

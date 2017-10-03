@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -223,9 +224,15 @@ func NewServer() (*Server, error) {
 		}
 		ipam := NewIPAMCacheK8s(&server, server.ipamUpdateHandler)
 		server.ipam = ipam
+		interval := PollingInterval
+		i, err := strconv.Atoi(os.Getenv(INTERVAL))
+		if err == nil {
+			interval = i
+		}
 		server.process = &IntervalProcessor{
-			k8scli: k8s,
-			ipam:   ipam,
+			interval: interval,
+			k8scli:   k8s,
+			ipam:     ipam,
 		}
 	} else {
 		log.Fatal("unsupported datastore type: ", datastoreType)
